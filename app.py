@@ -1,5 +1,8 @@
 import os
 import time
+import json
+import traceback
+from datetime import datetime
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -9,49 +12,48 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
-import requests
-import json
 
-# Page configuration
-st.set_page_config(page_title="Status Law Assistant", page_icon="⚖️")
+# Initialize environment variables
+load_dotenv()
 
-# Knowledge base info in session_state
-if 'kb_info' not in st.session_state:
-    st.session_state.kb_info = {
-        'build_time': None,
-        'size': None
+# --------------- Enhanced Logging System ---------------
+def log_interaction(user_input: str, bot_response: str, context: str):
+    """Log user interactions with context and error handling"""
+    try:
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "user_input": user_input,
+            "bot_response": bot_response,
+            "context": context,
+            "model": "llama-3.3-70b-versatile",
+            "kb_version": st.session_state.kb_info.get('version', '1.0')
+        }
+        
+        os.makedirs("chat_history", exist_ok=True)
+        log_path = os.path.join("chat_history", "chat_logs.json")
+        
+        # Atomic write operation with UTF-8 encoding
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+            
+    except Exception as e:
+        error_msg = f"Logging error: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)
+        st.error("Error saving interaction log. Please contact support.")
+
+# --------------- Page Configuration ---------------
+st.set_page_config(
+    page_title="Status Law Assistant",
+    page_icon="⚖️",
+    layout="wide",
+    menu_items={
+        'About': "### Legal AI Assistant powered by Status.Law"
     }
-
-# Display title and knowledge base info
-# st.title("www.Status.Law Legal Assistant")
-
-st.markdown(
-    '''
-    <h1>
-        ⚖️ 
-        <a href="https://status.law/" style="text-decoration: underline; color: blue; font-size: inherit;">
-            Status.Law
-        </a> 
-        Legal Assistant
-    </h1>
-    ''',
-    unsafe_allow_html=True
 )
 
-if st.session_state.kb_info['build_time'] and st.session_state.kb_info['size']:
-    st.caption(f"(Knowledge base build time: {st.session_state.kb_info['build_time']:.2f} seconds, "
-               f"size: {st.session_state.kb_info['size']:.2f} MB)")
-
-# Path to store vector database
+# --------------- Knowledge Base Management ---------------
 VECTOR_STORE_PATH = "vector_store"
-
-# Создание папки истории, если она не существует
-if not os.path.exists("chat_history"):
-    os.makedirs("chat_history")
-
-# Website URLs
-urls = [
+URLS = [
     "https://status.law",  
     "https://status.law/about",
     "https://status.law/careers",  
@@ -67,41 +69,31 @@ urls = [
     "https://status.law/faq"
 ]
 
-# Load secrets
-try:
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-except Exception as e:
-    st.error("Error loading secrets. Please check your configuration.")
-    st.stop()
-
-# Initialize models
-@st.cache_resource
 def init_models():
+    """Initialize AI models with caching"""
     llm = ChatGroq(
         model_name="llama-3.3-70b-versatile",
         temperature=0.6,
-        api_key=GROQ_API_KEY
+        api_key=os.getenv("GROQ_API_KEY")
     )
     embeddings = HuggingFaceEmbeddings(
         model_name="intfloat/multilingual-e5-large-instruct"
     )
     return llm, embeddings
 
-# Build knowledge base
 def build_knowledge_base(embeddings):
+    """Create or update the vector knowledge base"""
     start_time = time.time()
     
     documents = []
-    with st.status("Loading website content...") as status:
-        for url in urls:
+    with st.status("Building knowledge base..."):
+        for url in URLS:
             try:
                 loader = WebBaseLoader(url)
-                docs = loader.load()
-                documents.extend(docs)
-                status.update(label=f"Loaded {url}")
+                documents.extend(loader.load())
             except Exception as e:
-                st.error(f"Error loading {url}: {str(e)}")
-                
+                st.error(f"Failed to load {url}: {str(e)}")
+    
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=100
@@ -111,71 +103,53 @@ def build_knowledge_base(embeddings):
     vector_store = FAISS.from_documents(chunks, embeddings)
     vector_store.save_local(VECTOR_STORE_PATH)
     
-    end_time = time.time()
-    build_time = end_time - start_time
-    
-    # Calculate knowledge base size
-    total_size = 0
-    for path, dirs, files in os.walk(VECTOR_STORE_PATH):
-        for f in files:
-            fp = os.path.join(path, f)
-            total_size += os.path.getsize(fp)
-    size_mb = total_size / (1024 * 1024)
-    
-    # Save knowledge base info
-    st.session_state.kb_info['build_time'] = build_time
-    st.session_state.kb_info['size'] = size_mb
-    
-    st.success(f"""
-    Knowledge base created successfully:
-    - Time taken: {build_time:.2f} seconds
-    - Size: {size_mb:.2f} MB
-    - Number of chunks: {len(chunks)}
-    """)
+    # Update version information
+    st.session_state.kb_info.update({
+        'build_time': time.time() - start_time,
+        'size': sum(os.path.getsize(f) for f in os.listdir(VECTOR_STORE_PATH)) / (1024 ** 2),
+        'version': datetime.now().strftime("%Y%m%d-%H%M%S")
+    })
     
     return vector_store
 
-# Main function
+# --------------- Chat Interface ---------------
 def main():
-    # Initialize models
     llm, embeddings = init_models()
     
-    # Check if knowledge base exists
+    # Initialize or load knowledge base
     if not os.path.exists(VECTOR_STORE_PATH):
-        st.warning("Knowledge base not found.")
-        if st.button("Create Knowledge Base"):
-            vector_store = build_knowledge_base(embeddings)
-            st.session_state.vector_store = vector_store
-            st.rerun()
-    else:
-        if 'vector_store' not in st.session_state:
-            st.session_state.vector_store = FAISS.load_local(
-                VECTOR_STORE_PATH,
-                embeddings,
-                allow_dangerous_deserialization=True
-            )
+        if st.button("Initialize Knowledge Base"):
+            with st.spinner("Creating knowledge base..."):
+                st.session_state.vector_store = build_knowledge_base(embeddings)
+                st.rerun()
+        return
     
-    # Chat mode
-    if 'vector_store' in st.session_state:
-        if 'messages' not in st.session_state:
-            st.session_state.messages = []
-            
-        # Display chat history
-        for message in st.session_state.messages:
-            st.chat_message("user").write(message["question"])
-            st.chat_message("assistant").write(message["answer"])
-            
-        # User input
-        if question := st.chat_input("Ask your question"):
-            st.chat_message("user").write(question)
-            
-            # Retrieve context and generate response
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    context = st.session_state.vector_store.similarity_search(question)
-                    context_text = "\n".join([doc.page_content for doc in context])
+    if 'vector_store' not in st.session_state:
+        st.session_state.vector_store = FAISS.load_local(
+            VECTOR_STORE_PATH, embeddings, allow_dangerous_deserialization=True
+        )
+    
+    # Display chat history
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
+    
+    # Process user input
+    if user_input := st.chat_input("Ask your legal question"):
+        # Display user message
+        st.chat_message("user").write(user_input)
+        
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing your question..."):
+                try:
+                    # Retrieve relevant context
+                    context_docs = st.session_state.vector_store.similarity_search(user_input)
+                    context_text = "\n".join(d.page_content for d in context_docs)
                     
-                    prompt = PromptTemplate.from_template("""
+                    # Generate response
+                    prompt_template = PromptTemplate.from_template("""
                     You are a helpful and polite legal assistant at Status Law.
                     You answer in the language in which the question was asked.
                     Answer the question based on the context provided.
@@ -196,21 +170,31 @@ def main():
 
                     Context: {context}
                     Question: {question}
+                    
+                    Response Guidelines:
+                    1. Answer in the user's language
+                    2. Cite sources when possible
+                    3. Offer contact options if unsure
                     """)
                     
-                    chain = prompt | llm | StrOutputParser()
-                    response = chain.invoke({
+                    response = (prompt_template | llm | StrOutputParser()).invoke({
                         "context": context_text,
-                        "question": question
+                        "question": user_input
                     })
                     
+                    # Display and log interaction
                     st.write(response)
+                    log_interaction(user_input, response, context_text)
+                    st.session_state.messages.extend([
+                        {"role": "user", "content": user_input},
+                        {"role": "assistant", "content": response}
+                    ])
                     
-                    # Save chat history
-                    st.session_state.messages.append({
-                        "question": question,
-                        "answer": response
-                    })
+                except Exception as e:
+                    error_msg = f"Processing error: {str(e)}\n{traceback.format_exc()}"
+                    st.error("Error processing request. Please try again.")
+                    print(error_msg)
+                    log_interaction(user_input, "SYSTEM_ERROR", context_text)
 
 if __name__ == "__main__":
     main()
